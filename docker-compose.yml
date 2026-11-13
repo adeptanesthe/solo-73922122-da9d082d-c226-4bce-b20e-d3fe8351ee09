@@ -21,6 +21,13 @@ services:
       CONFIRM_WINDOW_SECONDS: "30"
       NFT_TABLE_NAME: "port_mgmt"
       DB_PATH: "/data/mgmt.db"
+      # 漂移核查/修复相关配置
+      NFT_READ_TIMEOUT_SECONDS: "8"
+      NFT_WRITE_TIMEOUT_SECONDS: "10"
+      # 本地演示漂移注入开关（生产环境置 0 关闭 /api/demo/inject）
+      DEMO_INJECTION_ENABLED: "1"
+      # 演示慢核查延迟默认关闭，需要时在网页或 API 按需传入
+      AUDIT_SLOW_DELAY_SECONDS: "0"
     restart: unless-stopped
     # 健康检查走回环接口（回环永远放行），不依赖白名单
     healthcheck:

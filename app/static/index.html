@@ -48,6 +48,18 @@
   .danger-note { border:1px dashed var(--err); border-radius:8px; padding:10px 12px;
                  color:#fca5a5; font-size:13px; margin-top:12px; }
   code { background:#0b1220; padding:1px 6px; border-radius:5px; font-size:12.5px; }
+  .btn-warn { background:var(--warn); color:#451a03; }
+  .btn-outline { background:transparent; border:1px solid var(--line); color:var(--txt); }
+  .audit-result { border-radius:8px; padding:12px 14px; margin-top:12px; font-size:13.5px;
+                  background:#0b1220; border:1px solid var(--line); display:none; }
+  .audit-result.show { display:block; }
+  .audit-result.in_sync { border-color:var(--ok); }
+  .audit-result.drift, .audit-result.missing_table { border-color:var(--err); }
+  .audit-result.unknown { border-color:var(--warn); }
+  input[type=number] { width:90px; padding:8px 10px; border-radius:8px;
+        border:1px solid var(--line); background:#0b1220; color:var(--txt); font-size:13px; }
+  .kv { color:var(--muted); }
+  .kv b { color:var(--txt); font-weight:600; }
 </style>
 </head>
 <body>
@@ -92,6 +104,43 @@
       已把网页端口移出白名单：本页面随后将失联（请求挂死/失败）。
       独立看护进程会在确认窗口到期后自动恢复旧规则，届时刷新本页即可恢复访问——无需登录宿主操作。
     </div>
+  </div>
+
+  <div class="card">
+    <h2>防火墙漂移核查与修复（读取真实 nft 专用表）</h2>
+    <p class="muted">
+      核查读取真实专用表 <code>inet port_mgmt</code>，比较<b>链属性与完整规则结构</b>
+      （自动忽略 handle 与计数器计数值）：缺表或结构不同判定为<b>漂移</b>，nft 读取失败判定为<b>未知</b>。
+      核查为只读、不阻塞应用/确认/回退；读取期间若发生合法策略改变会自动丢弃结果并重查。
+      修复绑定核查时的策略状态，之后若发生应用/确认/回退将返回 <b>409 且不写规则</b>；
+      待确认期间修复会保留原变更单与原截止时间，写入后重新读取核实，失败绝不报已恢复。
+    </p>
+    <div class="row">
+      <button class="btn-pri" id="auditCheckBtn">开始核查</button>
+      <label class="muted" style="display:flex;align-items:center;gap:6px">
+        演示慢核查延迟
+        <input type="number" id="slowDelayInput" min="0" max="30" step="1" value="0" /> 秒
+      </label>
+      <button class="btn-ok" id="repairBtn" disabled>按核查结果修复</button>
+      <span class="muted">当前策略版本号 <b id="epochTxt">-</b></span>
+    </div>
+    <div id="auditResult" class="audit-result"></div>
+    <div class="danger-note" style="margin-top:14px">
+      <b>本地演示：模拟“其他脚本”旁路改写专用表</b>（容器内执行，不走本系统写锁与版本号）
+      <div class="row" style="margin-top:8px">
+        <button class="btn-outline" id="injectExtraBtn">注入额外放行（TCP 22）</button>
+        <button class="btn-outline" id="injectMissingBtn">删除专用表（缺表）</button>
+        <button class="btn-outline" id="injectPolicyBtn">链策略改 accept（属性漂移）</button>
+      </div>
+      <pre class="muted" style="margin-top:8px">docker compose exec port-mgmt python drift_inject.py extra-port 22
+docker compose exec port-mgmt python drift_inject.py delete-table
+docker compose exec port-mgmt python drift_inject.py tamper-policy</pre>
+    </div>
+    <h2 style="margin-top:18px">最近核查/修复记录</h2>
+    <table>
+      <thead><tr><th>#</th><th>类型</th><th>结果</th><th>期望放行</th><th>实际放行</th><th>版本号</th><th>说明</th></tr></thead>
+      <tbody id="auditsBody"><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
+    </table>
   </div>
 
   <div class="grid2">
@@ -147,6 +196,8 @@ async function refresh() {
 
   $("confirmedPorts").innerHTML = portsPills(data.confirmed_ports);
   $("nftRules").textContent = (data.active_nft_rules || []).join("\n") || "（专用表暂无规则）";
+  $("epochTxt").textContent = data.policy_epoch ?? "-";
+  renderAudits(data.recent_audits || []);
 
   const pb = $("pendingBox");
   if (data.pending) {
@@ -256,6 +307,115 @@ async function loadConfig() {
 
 loadConfig().then(refresh);
 pollTimer = setInterval(refresh, 1500);
+
+// ---------------- 漂移核查 / 修复 / 演示注入 ----------------
+let lastAuditToken = null;
+
+const AUDIT_TEXT = {
+  in_sync: ["s-ok", "一致（无漂移）"],
+  drift: ["s-err", "规则结构漂移"],
+  missing_table: ["s-err", "专用表缺失（漂移）"],
+  unknown: ["s-warn", "未知（读取失败）"],
+  repaired: ["s-ok", "已修复并复核通过"],
+};
+
+function auditPill(result) {
+  const [cls, txt] = AUDIT_TEXT[result] || ["s-warn", result];
+  return `<span class="pill ${cls}">${txt}</span>`;
+}
+
+function renderAudits(rows) {
+  const html = rows.map(a => `
+    <tr><td>${a.id}</td>
+    <td>${a.kind === "repair" ? "修复" : "核查"}</td>
+    <td>${auditPill(a.result)}</td>
+    <td>${(a.expected_ports || []).map(p => "TCP " + p).join(", ") || "—"}</td>
+    <td>${(a.observed_ports || []).map(p => "TCP " + p).join(", ") || "—"}</td>
+    <td class="muted">${a.epoch_before ?? "—"}→${a.epoch_after ?? "—"}${a.attempts > 1 ? `（重查${a.attempts - 1}次）` : ""}</td>
+    <td class="muted">${a.detail ?? ""}</td></tr>`).join("");
+  $("auditsBody").innerHTML = html || '<tr><td colspan="7" class="muted">暂无核查记录</td></tr>';
+}
+
+function showAuditResult(data) {
+  const box = $("auditResult");
+  box.className = "audit-result show " + data.result;
+  const drift = data.is_drift;
+  box.innerHTML = `
+    <div>${auditPill(data.result)} <span class="kv">核查 #${data.audit_id}，耗时 ${data.duration_ms} ms，尝试 ${data.attempts} 次，策略版本号 <b>${data.epoch}</b></span></div>
+    <div class="kv" style="margin-top:6px">应生效（来源：${data.expected_source}）：<b>${(data.expected_ports || []).map(p=>"TCP "+p).join(", ")}</b></div>
+    <div class="kv">实际放行：<b>${(data.observed_ports || []).map(p=>"TCP "+p).join(", ") || "（无）"}</b></div>
+    <div class="kv" style="margin-top:6px">${data.detail}</div>
+    ${data.extra_allowed_ports && data.extra_allowed_ports.length ? `<div style="color:#fca5a5;margin-top:4px">额外放行：${data.extra_allowed_ports.map(p=>"TCP "+p).join(", ")}</div>` : ""}
+    ${data.missing_allowed_ports && data.missing_allowed_ports.length ? `<div style="color:#fcd34d;margin-top:4px">缺少放行：${data.missing_allowed_ports.map(p=>"TCP "+p).join(", ")}</div>` : ""}
+    <div class="muted" style="margin-top:6px">令牌仅绑定本次核查的策略状态；修复前若发生应用/确认/回退将返回 409。</div>`;
+  lastAuditToken = data.token;
+  // 仅漂移（含缺表）才允许修复；未知状态不允许臆测修复
+  $("repairBtn").disabled = !drift;
+}
+
+async function runAuditCheck() {
+  const btn = $("auditCheckBtn");
+  btn.disabled = true;
+  try {
+    const slow_delay = Number($("slowDelayInput").value || 0);
+    const r = await fetch("/api/audit/check", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ slow_delay }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "核查失败");
+    showAuditResult(data);
+    if (data.attempts > 1) banner("info", `核查期间检测到合法策略改变，已自动重查 ${data.attempts - 1} 次`);
+    await refresh();
+  } catch (e) {
+    banner("err", "核查失败：" + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function runRepair() {
+  if (!lastAuditToken) { banner("err", "请先执行核查"); return; }
+  const btn = $("repairBtn");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/audit/repair", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ token: lastAuditToken }),
+    });
+    const data = await r.json();
+    if (r.status === 409) throw new Error("409 冲突：" + (data.detail || "核查后策略状态已变化，未写规则"));
+    if (!r.ok) throw new Error(data.detail || "修复失败");
+    banner("ok", data.message);
+    lastAuditToken = null;
+    await refresh();
+    await runAuditCheck();  // 修复后立即再核查确认一致
+  } catch (e) {
+    banner("err", "修复被拒绝/失败：" + e.message);
+    btn.disabled = false;
+  }
+}
+
+async function injectDrift(action, port) {
+  try {
+    const r = await fetch("/api/demo/inject", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ action, port }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "注入失败");
+    banner("warn", `已注入漂移（${action}），请点击“开始核查”发现并修复`);
+    await refresh();
+  } catch (e) {
+    banner("err", "漂移注入失败：" + e.message);
+  }
+}
+
+$("auditCheckBtn").onclick = runAuditCheck;
+$("repairBtn").onclick = runRepair;
+$("injectExtraBtn").onclick = () => injectDrift("extra-port", 22);
+$("injectMissingBtn").onclick = () => injectDrift("delete-table", 22);
+$("injectPolicyBtn").onclick = () => injectDrift("tamper-policy", 22);
 </script>
 </body>
 </html>

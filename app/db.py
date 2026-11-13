@@ -23,6 +23,9 @@ EXPIRED = "expired"      # 超时未确认，看护进程已回退
 FAILED = "failed"        # 应用失败（规则未生效，旧规则保留）
 
 STATE_CONFIRMED_PORTS = "confirmed_ports"
+# 策略版本号：任何合法规则写入（应用/确认/回退/修复）都原子 +1。
+# 核查用它检测“读取期间策略是否被合法路径改写”；修复用它绑定核查时状态。
+STATE_POLICY_EPOCH = "policy_epoch"
 
 
 def _connect() -> sqlite3.Connection:
@@ -73,8 +76,27 @@ def init_db() -> None:
             BEGIN
                 SELECT RAISE(ABORT, 'already has a pending change');
             END;
+            CREATE TABLE IF NOT EXISTS audits (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind            TEXT NOT NULL,   -- check=核查 / repair=修复
+                result          TEXT NOT NULL,   -- in_sync/drift/missing_table/unknown/repaired/conflict/error
+                epoch_before    INTEGER,         -- 核查开始时的策略版本号
+                epoch_after     INTEGER,         -- 核查完成时的策略版本号
+                attempts        INTEGER NOT NULL DEFAULT 1, -- 期间被合法变更打断后的重查次数
+                expected_ports  TEXT,            -- 当时“应生效”白名单 JSON
+                observed_ports  TEXT,            -- 实际从 nft 读出的放行 TCP 端口 JSON
+                detail          TEXT,
+                created_at      REAL NOT NULL,
+                consumed        INTEGER NOT NULL DEFAULT 0  -- 修复令牌一次性消费标记
+            );
+            CREATE INDEX IF NOT EXISTS idx_audits_created ON audits(created_at);
             """
         )
+        # 旧库升级：补令牌一次性消费标记（列已存在时 ALTER 报错，忽略）
+        try:
+            conn.execute("ALTER TABLE audits ADD COLUMN consumed INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 
@@ -217,3 +239,98 @@ def expire_all_pending(reason: str, when: float) -> list[int]:
             )
         conn.commit()
     return ids
+
+
+def get_policy_epoch() -> int:
+    """读取当前策略版本号（不存在视为 0）。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM state WHERE key = ?", (STATE_POLICY_EPOCH,)
+        ).fetchone()
+    return int(row["value"]) if row is not None else 0
+
+
+def bump_policy_epoch() -> int:
+    """原子自增策略版本号并返回新值（所有合法规则写入路径共用）。"""
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value FROM state WHERE key = ?", (STATE_POLICY_EPOCH,)
+        ).fetchone()
+        new_epoch = (int(row["value"]) if row is not None else 0) + 1
+        conn.execute(
+            "INSERT INTO state(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (STATE_POLICY_EPOCH, str(new_epoch)),
+        )
+        conn.commit()
+    return new_epoch
+
+
+def insert_audit(
+    kind: str,
+    result: str,
+    created_at: float,
+    epoch_before: int | None = None,
+    epoch_after: int | None = None,
+    attempts: int = 1,
+    expected_ports: list[int] | None = None,
+    observed_ports: list[int] | None = None,
+    detail: str | None = None,
+) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO audits(kind, result, epoch_before, epoch_after, attempts, "
+            "expected_ports, observed_ports, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                kind,
+                result,
+                epoch_before,
+                epoch_after,
+                attempts,
+                json.dumps(sorted(expected_ports)) if expected_ports is not None else None,
+                json.dumps(sorted(observed_ports)) if observed_ports is not None else None,
+                detail,
+                created_at,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_audit(audit_id: int) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM audits WHERE id = ?", (audit_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_recent_audits(limit: int = 20) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audits ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def consume_audit_token(audit_id: int) -> bool:
+    """原子地把核查单标记为已消费。
+
+    返回 True 表示本次调用成功占用令牌；False 表示令牌已被消费过（重放）。
+    """
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT consumed FROM audits WHERE id = ? AND kind = 'check'",
+            (audit_id,),
+        ).fetchone()
+        if row is None or row["consumed"]:
+            conn.rollback()
+            return False
+        conn.execute(
+            "UPDATE audits SET consumed = 1 WHERE id = ?", (audit_id,)
+        )
+        conn.commit()
+    return True

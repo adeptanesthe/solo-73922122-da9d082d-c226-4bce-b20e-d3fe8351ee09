@@ -14,6 +14,7 @@ import time
 
 import db
 import nft
+import coordination
 from config import INITIAL_PORTS
 
 logging.basicConfig(
@@ -40,9 +41,11 @@ def bootstrap() -> list[int]:
         ports = sorted(ports)
         log.info("恢复已确认规则白名单 %s", ports)
 
-    # 先恢复防火墙，再开放网页：失败则让容器启动失败，避免“裸奔”对外
-    nft.apply_ruleset(ports)
-    log.info("nftables 专用表规则已恢复，现在可以启动 Web")
+    # 先恢复防火墙，再开放网页：失败则让容器启动失败，避免“裸奔”对外。
+    # 走统一跨进程写锁并推进 epoch：重启后所有旧核查令牌自然失效（409）。
+    coordination.run_rule_write(lambda: nft.apply_ruleset(ports))
+    log.info("nftables 专用表规则已恢复（策略版本号=%s），现在可以启动 Web",
+             db.get_policy_epoch())
     return ports
 
 

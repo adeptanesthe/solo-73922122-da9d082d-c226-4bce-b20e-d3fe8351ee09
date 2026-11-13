@@ -14,10 +14,12 @@ from typing import Any
 
 import db
 import nft
+import coordination
 from config import CONFIRM_WINDOW_SECONDS
 from db import FAILED, PENDING
 
-# 进程内串行化“应用”请求；跨进程的最终一致性由 SQLite 单 pending 约束保证
+# 进程内串行化“应用”请求；跨进程的最终一致性由 SQLite 单 pending 约束
+# 与 coordination 的跨进程规则写锁共同保证
 _apply_lock = threading.Lock()
 
 
@@ -79,8 +81,10 @@ def apply_change(requested_ports: list[int]) -> ApplyResult:
                 "存在待确认的变更（数据库并发约束），请先确认或等待其超时回退"
             ) from exc
         try:
-            # 3. 原子生效；nft 批量事务失败时内核保留旧规则
-            nft.apply_ruleset(ports)
+            # 3. 原子生效；nft 批量事务失败时内核保留旧规则。
+            # 跨进程写锁 + epoch 推进：与看护回退、漂移修复互斥，
+            # 成功写入后策略版本号 +1，正在进行的核查会据此丢弃旧结果。
+            coordination.run_rule_write(lambda: nft.apply_ruleset(ports))
         except Exception as exc:  # NftError 及其子类
             db.mark_change_status(change_id, FAILED, detail=f"应用失败，旧规则保留: {exc}")
             raise ChangeError(f"防火墙应用失败，已保留旧规则: {exc}") from exc
@@ -128,8 +132,9 @@ def confirm_change(change_id: int) -> dict[str, Any]:
     new_ports = json.loads(row["requested_ports"])
     db.set_confirmed_ports(new_ports)  # 持久化新的已确认规则
     # 竞争兜底：若看护进程在截止边界已把 nft 回退到旧规则，这里把规则
-    # 重新固化为已确认的新白名单，保证数据库状态与 nft 始终一致
-    nft.apply_ruleset(new_ports)
+    # 重新固化为已确认的新白名单，保证数据库状态与 nft 始终一致。
+    # 走统一写锁与 epoch，避免与修复/回退交错。
+    coordination.run_rule_write(lambda: nft.apply_ruleset(new_ports))
     return {
         "change_id": change_id,
         "confirmed_ports": new_ports,
@@ -151,16 +156,17 @@ def rollback_expired() -> list[int]:
 
     change_id = pending["id"]
     previous_ports = json.loads(pending["previous_ports"])
-    # 恢复旧规则（原子批量；失败则保留现状并抛错，下个轮询周期重试）
-    nft.apply_ruleset(previous_ports)
+    # 恢复旧规则（原子批量；失败则保留现状并抛错，下个轮询周期重试）。
+    # 统一写锁：与 Web 应用/确认、漂移修复互斥，成功后 epoch +1。
+    coordination.run_rule_write(lambda: nft.apply_ruleset(previous_ports))
 
     detail = f"超过 {CONFIRM_WINDOW_SECONDS:.0f}s 未确认，已自动回退到旧白名单"
-    won = db.mark_expired_if_pending(change_id, now, detail)
+    won = db.mark_expired_if_pending(change_id, time.time(), detail)
     if not won:
         # 竞争落败：确认路径已赢得状态机并写入新的已确认基线，
         # 放弃回退，把 nft 恢复为当前已确认规则
         current = db.get_confirmed_ports() or previous_ports
-        nft.apply_ruleset(current)
+        coordination.run_rule_write(lambda: nft.apply_ruleset(current))
         return []
     return [change_id]
 
@@ -180,4 +186,6 @@ def get_status() -> dict[str, Any]:
         "pending": pending,
         "active_nft_rules": nft.list_active_rules(),
         "recent_changes": db.list_recent_changes(),
+        "policy_epoch": db.get_policy_epoch(),
+        "recent_audits": db.list_recent_audits(limit=5),
     }
