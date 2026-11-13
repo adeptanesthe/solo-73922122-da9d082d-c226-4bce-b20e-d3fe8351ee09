@@ -1,0 +1,34 @@
+services:
+  port-mgmt:
+    build: .
+    image: port-mgmt:latest
+    container_name: port-mgmt
+    # 仅使用容器自有网络命名空间，不使用 network_mode: host
+    cap_add:
+      - NET_ADMIN   # 在容器网络命名空间内操作 nftables 所必需
+      - NET_RAW     # nft/排错工具所需（原始套接字）
+    ports:
+      # 浏览器入口：管理网页
+      - "8080:8080"
+      # 附带的 HTTP 回显服务
+      - "8090:8090"
+    volumes:
+      # SQLite 持久化：已确认规则与变更单跨容器重启保留
+      - port_mgmt_data:/data
+    environment:
+      WEB_PORT: "8080"
+      ECHO_PORT: "8090"
+      CONFIRM_WINDOW_SECONDS: "30"
+      NFT_TABLE_NAME: "port_mgmt"
+      DB_PATH: "/data/mgmt.db"
+    restart: unless-stopped
+    # 健康检查走回环接口（回环永远放行），不依赖白名单
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/config', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  port_mgmt_data:

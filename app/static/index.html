@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>入站端口白名单变更管理</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0;
+          --muted:#94a3b8; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; --pri:#3b82f6; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+         background:var(--bg); color:var(--txt); line-height:1.55; }
+  header { padding:20px 28px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:20px; margin:0; }
+  header .meta { color:var(--muted); font-size:13px; }
+  main { max-width:1080px; margin:0 auto; padding:24px 20px 60px; display:grid; gap:20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; }
+  .card h2 { margin:0 0 12px; font-size:16px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  @media (max-width:820px){ .grid2{grid-template-columns:1fr;} }
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px;
+          font-weight:600; margin:2px 4px 2px 0; }
+  .pill.port { background:#1d4ed8; color:#fff; }
+  .pill.s-ok { background:rgba(34,197,94,.18); color:var(--ok); }
+  .pill.s-warn { background:rgba(245,158,11,.18); color:var(--warn); }
+  .pill.s-err { background:rgba(239,68,68,.18); color:var(--err); }
+  .muted { color:var(--muted); font-size:13px; }
+  input[type=text] { width:100%; padding:10px 12px; border-radius:8px;
+        border:1px solid var(--line); background:#0b1220; color:var(--txt); font-size:14px; }
+  button { border:0; border-radius:8px; padding:10px 16px; font-size:14px;
+           font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .btn-pri { background:var(--pri); color:#fff; }
+  .btn-ok { background:var(--ok); color:#052e16; }
+  .btn-danger { background:var(--err); color:#fff; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px; }
+  pre { background:#0b1220; border:1px solid var(--line); border-radius:8px;
+        padding:12px; overflow:auto; font-size:12.5px; max-height:260px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  #banner { padding:12px 16px; border-radius:10px; display:none; font-size:14px; }
+  #banner.info { display:block; background:rgba(59,130,246,.15); border:1px solid #3b82f6; }
+  #banner.ok { display:block; background:rgba(34,197,94,.15); border:1px solid var(--ok); }
+  #banner.err { display:block; background:rgba(239,68,68,.15); border:1px solid var(--err); }
+  .count { font-size:30px; font-weight:700; color:var(--warn); font-variant-numeric:tabular-nums; }
+  .danger-note { border:1px dashed var(--err); border-radius:8px; padding:10px 12px;
+                 color:#fca5a5; font-size:13px; margin-top:12px; }
+  code { background:#0b1220; padding:1px 6px; border-radius:5px; font-size:12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>入站端口白名单变更管理</h1>
+  <span class="meta">FastAPI + SQLite + nftables（容器内专用表 <code>inet port_mgmt</code>，不使用宿主网络）</span>
+</header>
+
+<main>
+  <div id="banner"></div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>当前已确认白名单（持久规则）</h2>
+      <div id="confirmedPorts"><span class="muted">加载中…</span></div>
+      <p class="muted" style="margin-top:10px">
+        网页端口 <code id="webPortTxt">-</code>，回显服务端口 <code id="echoPortTxt">-</code>。
+        整套服务重启时先恢复该白名单，再开放网页。
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>待确认变更</h2>
+      <div id="pendingBox"><span class="muted">当前没有待确认变更</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>应用新的 TCP 端口白名单</h2>
+    <p class="muted">
+      输入逗号/空格分隔的 TCP 端口。规则立即生效，过滤所有非回环入站流量
+      （白名单外的 TCP 已有连接同样被丢弃）；<b>生效后需在确认窗口内确认，否则自动回退</b>。
+      有待确认变更时拒绝新变更。
+    </p>
+    <input id="portsInput" type="text" placeholder="例如：8080, 8090, 22" />
+    <div class="row">
+      <button class="btn-pri" id="applyBtn">应用变更</button>
+      <button class="btn-pri" id="fillWebEcho">填入 网页+回显</button>
+      <button class="btn-danger" id="demoDropWeb">演示：移除网页端口（模拟误封失联）</button>
+    </div>
+    <div class="danger-note" id="demoHint" style="display:none">
+      已把网页端口移出白名单：本页面随后将失联（请求挂死/失败）。
+      独立看护进程会在确认窗口到期后自动恢复旧规则，届时刷新本页即可恢复访问——无需登录宿主操作。
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>nftables 专用表生效规则</h2>
+      <pre id="nftRules">加载中…</pre>
+    </div>
+    <div class="card">
+      <h2>最近变更记录（SQLite 持久化）</h2>
+      <table>
+        <thead><tr><th>#</th><th>请求端口</th><th>原端口</th><th>状态</th><th>说明</th></tr></thead>
+        <tbody id="changesBody"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<script>
+let pollTimer = null, countdownTimer = null, lastPending = null, offline = false;
+const $ = (id) => document.getElementById(id);
+
+function banner(kind, msg) {
+  const el = $("banner");
+  el.className = kind;
+  el.textContent = msg;
+  if (kind === "ok") setTimeout(() => { el.className = ""; el.textContent = ""; }, 5000);
+}
+
+function portsPills(ports) {
+  if (!ports || !ports.length) return '<span class="muted">（空）</span>';
+  return ports.map(p => `<span class="pill port">TCP ${p}</span>`).join("");
+}
+
+function statusPill(s) {
+  const map = { confirmed:["s-ok","已确认"], pending:["s-warn","待确认"],
+                expired:["s-err","已过期回退"], rolled_back:["s-err","已回退"],
+                failed:["s-err","应用失败"] };
+  const [cls, txt] = map[s] || ["s-warn", s];
+  return `<span class="pill ${cls}">${txt}</span>`;
+}
+
+async function refresh() {
+  let data;
+  try {
+    const r = await fetch("/api/status", { cache: "no-store" });
+    data = await r.json();
+    if (offline) { offline = false; banner("ok", "访问已恢复：看护进程已回退到旧白名单（或变更已确认）"); }
+  } catch (e) {
+    offline = true;
+    banner("err", "网页暂时失联（网页端口已不在白名单）。等待看护进程自动回退，本页会持续重试…");
+    return;
+  }
+
+  $("confirmedPorts").innerHTML = portsPills(data.confirmed_ports);
+  $("nftRules").textContent = (data.active_nft_rules || []).join("\n") || "（专用表暂无规则）";
+
+  const pb = $("pendingBox");
+  if (data.pending) {
+    lastPending = data.pending;
+    pb.innerHTML = `
+      <div>变更单 <b>#${data.pending.id}</b>：目标白名单 ${portsPills(data.pending.requested_ports)}</div>
+      <div class="muted" style="margin:6px 0">应用前快照：${portsPills(data.pending.previous_ports)}</div>
+      <div>剩余确认时间 <span class="count" id="countdown">${data.pending.remaining_seconds.toFixed(1)}</span> 秒</div>
+      <div class="row">
+        <button class="btn-ok" id="confirmBtn">确认保留本次变更</button>
+        <span class="muted">不确认则到期自动回退到应用前规则</span>
+      </div>`;
+    $("confirmBtn").onclick = () => confirmChange(data.pending.id);
+    startCountdown(data.pending.expires_at);
+    $("applyBtn").disabled = true;
+  } else {
+    lastPending = null;
+    pb.innerHTML = '<span class="muted">当前没有待确认变更</span>';
+    stopCountdown();
+    $("applyBtn").disabled = false;
+  }
+
+  const rows = (data.recent_changes || []).map(c => `
+    <tr><td>${c.id}</td><td>${(c.requested_ports||[]).map(p=>"TCP "+p).join(", ")}</td>
+    <td>${(c.previous_ports||[]).map(p=>"TCP "+p).join(", ")||"—"}</td>
+    <td>${statusPill(c.status)}</td>
+    <td class="muted">${c.detail ?? ""}</td></tr>`).join("");
+  $("changesBody").innerHTML = rows || '<tr><td colspan="5" class="muted">暂无记录</td></tr>';
+}
+
+function startCountdown(expiresAt) {
+  stopCountdown();
+  countdownTimer = setInterval(() => {
+    const el = $("countdown");
+    if (!el) { stopCountdown(); return; }
+    const remain = Math.max(0, expiresAt - Date.now() / 1000);
+    el.textContent = remain.toFixed(1);
+    if (remain <= 0) stopCountdown();
+  }, 100);
+}
+function stopCountdown() { if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; } }
+
+async function applyPorts(ports) {
+  $("applyBtn").disabled = true;
+  try {
+    const r = await fetch("/api/apply", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ ports }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "应用被拒绝");
+    banner("info", data.message);
+    $("demoHint").style.display = "none";
+    await refresh();
+  } catch (e) {
+    banner("err", "应用失败：" + e.message);
+    $("applyBtn").disabled = false;
+  }
+}
+
+async function confirmChange(id) {
+  try {
+    const r = await fetch("/api/confirm", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ change_id: id }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "确认失败");
+    banner("ok", `变更单 #${id} 已确认，白名单固化：${data.confirmed_ports.join(", ")}`);
+    await refresh();
+  } catch (e) {
+    banner("err", "确认失败：" + e.message);
+    await refresh();
+  }
+}
+
+function parsePorts(text) {
+  const ports = [...new Set(text.split(/[\s,，;；]+/).filter(Boolean).map(Number))];
+  if (ports.some(p => !Number.isInteger(p) || p < 1 || p > 65535)) {
+    throw new Error("端口必须是 1-65535 的整数");
+  }
+  if (!ports.length) throw new Error("请至少输入一个端口");
+  return ports;
+}
+
+$("applyBtn").onclick = () => {
+  let ports;
+  try { ports = parsePorts($("portsInput").value); }
+  catch (e) { banner("err", e.message); return; }
+  applyPorts(ports);
+};
+
+async function loadConfig() {
+  const r = await fetch("/api/config");
+  const cfg = await r.json();
+  $("webPortTxt").textContent = cfg.web_port;
+  $("echoPortTxt").textContent = cfg.echo_port;
+  $("fillWebEcho").onclick = () => { $("portsInput").value = `${cfg.web_port}, ${cfg.echo_port}`; };
+  $("demoDropWeb").onclick = () => {
+    const ports = [cfg.echo_port];
+    $("portsInput").value = ports.join(", ");
+    $("demoHint").style.display = "block";
+    banner("warn", `即将应用仅含回显端口 ${cfg.echo_port} 的白名单，网页端口 ${cfg.web_port} 将被封禁…`);
+    applyPorts(ports);
+  };
+}
+
+loadConfig().then(refresh);
+pollTimer = setInterval(refresh, 1500);
+</script>
+</body>
+</html>
